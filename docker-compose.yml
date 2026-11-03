@@ -1,0 +1,141 @@
+# HRIS WFH — seluruh stack: docker compose up -d --build
+# Port host: frontend 8080 · gateway 3000 · MySQL 3307 · RabbitMQ 5673 (UI 15673) · S3 9100 (console 9101)
+
+x-backend: &backend
+  build: ./backend
+  image: hris-wfh-backend:latest
+  restart: unless-stopped
+  depends_on:
+    mysql:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
+x-common-env: &common-env
+  NODE_ENV: production
+  DB_HOST: mysql
+  DB_PORT: 3306
+  RABBITMQ_URL: amqp://hris:hris_rabbit_pass@rabbitmq:5672
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev-only-jwt-secret-change-me-0123456789abcdef}
+  SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+  AUTH_SERVICE_HOST: auth-service
+  AUTH_SERVICE_PORT: 4001
+  EMPLOYEE_SERVICE_HOST: employee-service
+  EMPLOYEE_SERVICE_PORT: 4002
+  ATTENDANCE_SERVICE_HOST: attendance-service
+  ATTENDANCE_SERVICE_PORT: 4003
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_pass}
+      TZ: UTC
+    command: ["--default-time-zone=+00:00"]
+    ports: ["3307:3306"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: hris
+      RABBITMQ_DEFAULT_PASS: hris_rabbit_pass
+    ports: ["5673:5672", "15673:15672"]
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  # Object storage S3-compatible (RustFS). Image MinIO community tidak lagi didistribusikan;
+  # driver "s3" di gateway memakai SDK minio sehingga bisa diarahkan ke MinIO/AWS S3 juga.
+  s3:
+    image: rustfs/rustfs:1.0.2
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-hrisadmin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-hris-s3-secret-123}
+    ports: ["9100:9000", "9101:9001"]
+    volumes: [s3-data:/data]
+
+  auth-service:
+    <<: *backend
+    command: ["node", "dist/apps/auth-service/main.js"]
+    environment:
+      <<: *common-env
+      DB_USERNAME: auth_svc
+      DB_PASSWORD: auth_svc_pass
+      AUTH_DB_NAME: hris_auth_db
+      BCRYPT_ROUNDS: 12
+
+  employee-service:
+    <<: *backend
+    command: ["node", "dist/apps/employee-service/main.js"]
+    environment:
+      <<: *common-env
+      DB_USERNAME: employee_svc
+      DB_PASSWORD: employee_svc_pass
+      EMPLOYEE_DB_NAME: hris_employee_db
+
+  attendance-service:
+    <<: *backend
+    command: ["node", "dist/apps/attendance-service/main.js"]
+    environment:
+      <<: *common-env
+      DB_USERNAME: attendance_svc
+      DB_PASSWORD: attendance_svc_pass
+      ATTENDANCE_DB_NAME: hris_attendance_db
+
+  api-gateway:
+    <<: *backend
+    command: ["node", "dist/apps/api-gateway/main.js"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      s3:
+        condition: service_started
+      auth-service:
+        condition: service_started
+      employee-service:
+        condition: service_started
+      attendance-service:
+        condition: service_started
+    environment:
+      <<: *common-env
+      GATEWAY_PORT: 3000
+      PUBLIC_BASE_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:8080,http://localhost:5173
+      FILE_URL_SECRET: ${FILE_URL_SECRET:-dev-only-file-url-secret-change-me-0123456789}
+      STORAGE_DRIVER: s3
+      S3_ENDPOINT: s3
+      S3_PORT: 9000
+      S3_USE_SSL: "false"
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-hrisadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-hris-s3-secret-123}
+      S3_BUCKET: attendance-photos
+    ports: ["3000:3000"]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:3000/api/v1
+        VITE_WS_URL: http://localhost:3000
+    restart: unless-stopped
+    depends_on: [api-gateway]
+    ports: ["8080:80"]
+
+volumes:
+  mysql-data:
+  rabbitmq-data:
+  s3-data:
